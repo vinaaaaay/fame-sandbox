@@ -1,0 +1,26 @@
+services:
+  sandbox:
+    build: 
+      context: .
+    image: agent-sandbox-custom:latest
+    restart: unless-stopped
+    
+    # 1. Port Mapping (-p 8080:8080)
+    ports:
+      - "8080:8080"
+      
+    # 2. Security Options (--security-opt seccomp=unconfined)
+    security_opt:
+      - seccomp:unconfined
+      
+    # 3. Interactive/TTY (-it)
+    stdin_open: true
+    tty: true
+    shm_size: '2gb'
+
+    # 4. Resource Limits
+    deploy:
+      resources:
+        limits:
+          cpus: '3.5'
+          memory: 14G

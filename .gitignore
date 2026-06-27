@@ -1,0 +1,9 @@
+mcp_env/
+logs/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.log
+*.env
+archive
