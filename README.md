@@ -33,3 +33,7 @@ Docker compose installation
 
 
 docker compose build --no-cache sandbox
+
+sudo journalctl -u sandbox-mcp -f
+
+sudo systemctl restart sandbox-mcp

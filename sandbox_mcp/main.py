@@ -7,7 +7,7 @@ Communicates with the container via its REST APIs (localhost:8080).
 
 Tools exposed:
   - exec_sandbox   (task-based)   -- runs a bash command in the container via /v1/bash (Bash Pipe API)
-  - write_file     (sync)         -- writes a file in the container via /v1/file/write
+   - write_file     (task-based)   -- writes a file in the container via /v1/file/write
   - read_file      (sync)         -- reads a file in the container via /v1/file/read
   - kill_processes (sync)         -- kills processes for a given node/iteration
 
@@ -62,8 +62,7 @@ logger = logging.getLogger("sandbox_mcp")
 
 EXEC_TOOL_NAME = "exec_sandbox"
 CONTAINER_URL = os.environ.get("CONTAINER_URL", "http://localhost:8080")
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-COMPOSE_DIR = os.environ.get("SANDBOX_COMPOSE_DIR", os.path.dirname(_THIS_DIR))
+COMPOSE_DIR = os.environ.get("SANDBOX_COMPOSE_DIR", "/home/ubuntu/haseeb")
 DOCKER_CMD = os.environ.get("DOCKER_CMD", "docker").split()
 AUTH_KEY = os.environ.get("SANDBOX_MCP_AUTH_KEY") or None
 TERMINAL = {"completed", "failed", "cancelled"}
@@ -106,7 +105,7 @@ def _run_command_on_sandbox(arguments: dict) -> dict:
     offset-based incremental reads — no output lost at timeout.
     Called from within anyio.to_thread.run_sync — blocking is fine."""
     command = arguments.get("command", "echo 'no command'")
-    user_timeout = int(arguments.get("timeout", 1200))
+    user_timeout = int(arguments.get("timeout", 1800))
     cwd = arguments.get("cwd", "")
     if cwd:
         command = f"mkdir -p {cwd} && cd {cwd} && {command}"
@@ -302,7 +301,7 @@ def _do_reset_sandbox() -> dict:
     result = subprocess.run(
         [*DOCKER_CMD, "compose", "down"],
         cwd=COMPOSE_DIR,
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=300,
     )
     logger.info(f"[reset] docker compose down rc={result.returncode}")
     if result.returncode != 0:
@@ -318,9 +317,9 @@ def _do_reset_sandbox() -> dict:
         return {"success": False, "message": f"compose up failed: {result.stderr[:300]}"}
     logger.info("[reset] docker compose up succeeded")
 
-    health_url = f"{CONTAINER_URL}/v1/shell/exec"
+    health_url = f"{CONTAINER_URL}/v1/bash/exec"
     probe_cmd = "/home/gem/workspace/.venv/bin/python -c 'print(\"ready\")'"
-    max_wait = 120
+    max_wait = 300
     start = time.time()
     while time.time() - start < max_wait:
         try:
@@ -328,14 +327,14 @@ def _do_reset_sandbox() -> dict:
                 resp = client.post(health_url, json={"command": probe_cmd})
                 if resp.status_code == 200:
                     data = resp.json()
-                    if data.get("success") and "ready" in data.get("data", {}).get("output", ""):
+                    if data.get("success") and "ready" in data.get("data", {}).get("stdout", ""):
                         logger.info(f"[reset] container healthy after {time.time() - start:.1f}s")
                         break
         except Exception:
             pass
-        time.sleep(2)
+        time.sleep(15)
     else:
-        return {"success": True, "message": "container up but health check timed out in 120s"}
+        return {"success": False, "message": "container up but health check timed out in 120s"}
 
     def _prune():
         try:
@@ -394,6 +393,53 @@ async def _exec_sandbox_fallback(arguments: dict) -> CallToolResult:
         )
 
     return result
+
+
+async def _write_file_fallback(arguments: dict) -> CallToolResult:
+    path = arguments.get("path", "")
+    content = arguments.get("content", "")
+    callback_url = arguments.get("callback_url")
+    correlation_id = arguments.get("correlation_id")
+    resume_url = arguments.get("resume_url", "")
+
+    if not path:
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps({"success": False, "message": "path is required"}))],
+            isError=True)
+
+    t0 = time.time()
+    result = await anyio.to_thread.run_sync(_write_file_on_sandbox, path, content)
+    duration_ms = (time.time() - t0) * 1000
+
+    session_id = arguments.get("session_id", "")
+    wl = SandboxLogger(
+        experiment_name=arguments.get("experiment_name", "unknown_experiment"),
+        session_id=session_id or "nosession",
+        node_id=arguments.get("node_id"),
+    )
+    wl.log_tool_call(
+        tool_name="write_file",
+        args_summary=f"path={path} size={len(content)}",
+        duration_ms=duration_ms,
+        success=result.get("success", False),
+        error=result.get("message", ""),
+    )
+
+    call_result = CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(result))],
+        isError=not result.get("success", False),
+    )
+
+    if arguments.get("delivery") == "callback":
+        await deliver_callback(
+            callback_url,
+            task_id=correlation_id or f"notask_{uuid.uuid4().hex[:8]}",
+            correlation_id=correlation_id,
+            result=call_result,
+            resume_url=resume_url,
+        )
+
+    return call_result
 
 
 def build_server(store: InMemoryTaskStore | None = None) -> Server:
@@ -458,12 +504,17 @@ def build_server(store: InMemoryTaskStore | None = None) -> Server:
                     "properties": {
                         "path": {"type": "string", "description": "Absolute path inside the container"},
                         "content": {"type": "string", "description": "File content to write"},
+                        "delivery": {"type": "string", "enum": ["callback", "poll"]},
+                        "callback_url": {"type": "string"},
+                        "correlation_id": {"type": "string"},
+                        "resume_url": {"type": "string"},
                         "session_id": {"type": "string", "description": "Orchestration session ID for logging"},
                         "experiment_name": {"type": "string", "description": "Experiment name for log grouping"},
                         "node_id": {"type": "integer", "description": "MCTS node ID for log grouping"},
                     },
                     "required": ["path", "content"],
                 },
+                execution=ToolExecution(taskSupport=TASK_REQUIRED),
             ),
             Tool(
                 name="read_file",
@@ -494,36 +545,69 @@ def build_server(store: InMemoryTaskStore | None = None) -> Server:
         if name == "write_file":
             path = arguments.get("path", "")
             content = arguments.get("content", "")
-            session_id = arguments.get("session_id", "")
-            experiment_name = arguments.get("experiment_name", "")
-            node_id = arguments.get("node_id")
-
             if not path:
                 return CallToolResult(
                     content=[TextContent(type="text", text=json.dumps({"success": False, "message": "path is required"}))],
                     isError=True)
 
-            t0 = time.time()
-            result = await anyio.to_thread.run_sync(_write_file_on_sandbox, path, content)
-            duration_ms = (time.time() - t0) * 1000
+            ctx = server.request_context
+            try:
+                ctx.experimental.validate_task_mode(TASK_REQUIRED)
+            except McpError:
+                return await _write_file_fallback(arguments)
 
-            wl = SandboxLogger(
-                experiment_name=experiment_name,
-                session_id=session_id or "nosession",
-                node_id=node_id,
-            )
-            wl.log_tool_call(
-                tool_name="write_file",
-                args_summary=f"path={path} size={len(content)}",
-                duration_ms=duration_ms,
-                success=result.get("success", False),
-                error=result.get("message", ""),
-            )
+            mode = arguments.get("delivery", "callback")
+            callback_url = arguments.get("callback_url")
+            correlation_id = arguments.get("correlation_id")
+            resume_url = arguments.get("resume_url", "")
+            session_id = arguments.get("session_id", "")
+            experiment_name = arguments.get("experiment_name", "")
+            node_id = arguments.get("node_id")
 
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(result))],
-                isError=not result.get("success", False),
-            )
+            async def work(task: ServerTaskContext) -> CallToolResult:
+                with anyio.CancelScope(shield=True):
+                    if mode == "poll":
+                        await task.update_status("executing")
+
+                    t0 = time.time()
+                    payload = await anyio.to_thread.run_sync(_write_file_on_sandbox, path, content)
+                    duration_ms = (time.time() - t0) * 1000
+
+                    if task.is_cancelled:
+                        return CallToolResult(
+                            content=[TextContent(type="text", text="cancelled")],
+                            isError=False)
+
+                    is_error = not payload.get("success", False)
+                    result = CallToolResult(
+                        content=[TextContent(type="text", text=json.dumps(payload))],
+                        isError=is_error)
+
+                    wl = SandboxLogger(
+                        experiment_name=experiment_name or "unknown_experiment",
+                        session_id=session_id or "nosession",
+                        node_id=node_id,
+                    )
+                    wl.log_tool_call(
+                        tool_name="write_file",
+                        args_summary=f"path={path} size={len(content)}",
+                        duration_ms=duration_ms,
+                        success=payload.get("success", False),
+                        error=payload.get("message", ""),
+                    )
+
+                    if mode == "callback":
+                        await deliver_callback(
+                            callback_url,
+                            task_id=task.task_id,
+                            correlation_id=correlation_id,
+                            result=result,
+                            resume_url=resume_url,
+                        )
+
+                    return result
+
+            return await ctx.experimental.run_task(work)
 
         if name == "read_file":
             path = arguments.get("path", "")
