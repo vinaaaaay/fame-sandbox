@@ -1,0 +1,7 @@
+mcp>=1.23,<2
+anyio
+httpx
+uvicorn
+starlette
+python-dotenv
+boto3

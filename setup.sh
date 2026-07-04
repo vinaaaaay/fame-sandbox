@@ -76,7 +76,7 @@ docker compose -f "$REPO_DIR/docker-compose.yaml" up -d sandbox
 info "Sandbox container started. Waiting for health check..."
 
 # Health check
-HEALTH_URL="http://localhost:${CONTAINER_PORT}/v1/shell/exec"
+HEALTH_URL="http://localhost:${CONTAINER_PORT}/v1/bash/exec"
 PROBE_CMD="python3 -c 'print(\"ready\")'"
 MAX_WAIT=120
 START_TIME=$(date +%s)
@@ -104,7 +104,7 @@ fi
 
 source "$REPO_DIR/mcp_env/bin/activate"
 pip install --quiet --upgrade pip
-pip install --quiet -r "$REPO_DIR/requirements.txt"
+pip install --quiet -r "$REPO_DIR/requirements_mcp.txt"
 deactivate
 info "Python dependencies installed"
 
@@ -112,11 +112,8 @@ info "Python dependencies installed"
 SERVICE_NAME="sandbox-mcp"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-if [ -f "$SERVICE_FILE" ]; then
-    info "systemd service $SERVICE_NAME already exists — skipping"
-else
-    info "Installing systemd service for MCP server..."
-    sudo tee "$SERVICE_FILE" > /dev/null <<-EOF
+info "Configuring systemd service for MCP server..."
+sudo tee "$SERVICE_FILE" > /dev/null <<-EOF
 [Unit]
 Description=Sandbox MCP Server
 After=docker.service network-online.target
@@ -139,10 +136,9 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable "$SERVICE_NAME"
-    info "systemd service installed and enabled"
-fi
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE_NAME"
+info "systemd service configured and enabled"
 
 sudo systemctl restart "$SERVICE_NAME"
 info "MCP server service restarted"
